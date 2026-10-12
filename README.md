@@ -110,3 +110,7 @@ node test-e2e.mjs <salida> <carpeta_vox> # además carga y dibuja los ejemplos d
 Referencia del formato: [voxel-model](https://github.com/ephtracy/voxel-model) de ephtracy.
 
 MagicaVoxel es un programa de [ephtracy](https://ephtracy.github.io/). Este proyecto no está afiliado a él.
+
+## Licencia
+
+[MIT](LICENSE) © Anthonyzok521
