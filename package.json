@@ -1,0 +1,34 @@
+{
+  "name": "mcp-magicavoxel",
+  "version": "1.0.0",
+  "description": "MCP server that lets AI agents build voxel models and save them as MagicaVoxel .vox files",
+  "main": "src/server.mjs",
+  "bin": {
+    "mcp-magicavoxel": "src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node test-e2e.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "magicavoxel",
+    "voxel",
+    "vox",
+    "claude"
+  ],
+  "author": "Anthonyzok521 <anthonyzok521@gmail.com>",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anthonyzok521/mcp-magicavoxel.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.6"
+  }
+}
