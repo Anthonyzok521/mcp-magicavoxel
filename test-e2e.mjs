@@ -52,6 +52,13 @@ assert.match(await call('fill_box', { model: 'box', from: [0, 0, 0], to: [1, 1, 
 assert.match(await call('fill_box', { model: 'box', from: [0, 0, 0], to: [1, 1, 1], color: '#ff0000' }), /Painted 0 /);
 assert.match(await call('fill_box', { model: 'box', from: [0, 0, 0], to: [9, 9, 9], color: 'empty' }), /Erased 8 /);
 
+// --- Beveled boxes: 5x5x5 = 125; bevel 1 drops the 12 edges (44 voxels), only vertical edges drops 20.
+await call('create_model', { name: 'bev', size: [5, 5, 5], position: [20, 0, 0] });
+assert.match(await call('fill_box', { model: 'bev', from: [0, 0, 0], to: [4, 4, 4], color: '#ff0000', bevel: 1 }), /Painted 81 /);
+await call('fill_box', { model: 'bev', from: [0, 0, 0], to: [4, 4, 4], color: 'empty' });
+assert.match(await call('fill_box', { model: 'bev', from: [0, 0, 0], to: [4, 4, 4], color: '#ff0000', bevel: 1, bevel_axes: 'z' }), /Painted 105 /);
+await call('delete_model', { model: 'bev' });
+
 // --- draw_line thickness 2 is really two voxels thick.
 assert.match(await call('draw_line', { model: 'box', from: [0, 0, 0], to: [3, 0, 0], color: '#00ff00', thickness: 2 }), /changing 20 /);
 assert.match(await call('draw_line', { model: 'box', from: [0, 5, 5], to: [4, 5, 5], color: '#0000ff', thickness: 3 }), /changing 50 /);

@@ -140,22 +140,41 @@ tool(
 
 tool(
   'fill_box',
-  'Fill (or erase) an axis-aligned box between two corners, inclusive. Parts outside the model are clipped.',
+  'Fill (or erase) an axis-aligned box between two corners, inclusive. Parts outside the model are clipped. ' +
+    'bevel cuts its edges at 45 degrees for a chunky low-poly look.',
   {
     model: modelName,
     from: vec3,
     to: vec3,
     color,
     hollow: z.boolean().optional().describe('Only paint the outer shell, one voxel thick.'),
+    bevel: z.number().int().min(0).optional().describe('Voxels cut from every edge at 45 degrees. Default 0.'),
+    bevel_axes: z
+      .enum(['all', 'x', 'y', 'z'])
+      .optional()
+      .describe('"all" (default) bevels every edge; "z" only the vertical edges (edges parallel to z), and so on.'),
   },
-  async ({ model, from, to, color, hollow }) => {
+  async ({ model, from, to, color, hollow, bevel = 0, bevel_axes = 'all' }) => {
     const m = scene.model(model);
     const c = scene.colorIndex(color);
     const lo = from.map((v, k) => Math.min(v, to[k]));
     const hi = from.map((v, k) => Math.max(v, to[k]));
-    const n = paint(m, c, lo, hi, (x, y, z) =>
-      !hollow || x === lo[0] || x === hi[0] || y === lo[1] || y === hi[1] || z === lo[2] || z === hi[2],
-    );
+    // An edge parallel to axis k is cut where the distances to the two other faces add up to less than bevel.
+    const edges = bevel_axes === 'all' ? [0, 1, 2] : [{ x: 0, y: 1, z: 2 }[bevel_axes]];
+    const inside = (p) => {
+      if (p.some((v, k) => v < lo[k] || v > hi[k])) return false;
+      if (!bevel) return true;
+      const d = p.map((v, k) => Math.min(v - lo[k], hi[k] - v));
+      return edges.every((k) => {
+        const [a, b] = [0, 1, 2].filter((j) => j !== k);
+        return d[a] + d[b] >= bevel;
+      });
+    };
+    const n = paint(m, c, lo, hi, (x, y, z) => {
+      if (!inside([x, y, z])) return false;
+      if (!hollow) return true;
+      return [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(([a, b, e]) => !inside([x + a, y + b, z + e]));
+    });
     return done(m, n, c);
   },
 );

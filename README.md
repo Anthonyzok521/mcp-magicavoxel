@@ -70,7 +70,7 @@ Reinicia Claude Code y comprueba con `claude mcp list` que `voxel` aparece como 
 | `create_model` | Crea un objeto (tamaño y posición en el mundo) |
 | `move_model` / `delete_model` | Mueve o elimina un objeto |
 | `duplicate_model` | Copia un objeto, opcionalmente en espejo respecto a un plano (por ejemplo, el brazo izquierdo a partir del derecho) |
-| `fill_box` | Caja maciza o hueca |
+| `fill_box` | Caja maciza o hueca, con `bevel` para biselar las aristas a 45° (estilo low-poly) |
 | `fill_sphere` | Esfera o elipsoide, maciza o hueca |
 | `fill_cylinder` | Cilindro o cono en el eje x, y o z |
 | `draw_line` | Línea entre dos puntos, con grosor |
