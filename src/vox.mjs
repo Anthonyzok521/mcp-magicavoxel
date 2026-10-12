@@ -27,6 +27,16 @@ export class Model {
     this.size = size;
     this.position = position; // world coordinate of local voxel (0,0,0)
     this.voxels = new Uint8Array(size[0] * size[1] * size[2]); // palette index, 0 = empty
+    this.pivot = null; // world-space joint position; null means the center of the model box
+    this.parent = null; // name of the parent model in the rig
+  }
+
+  clone(name = this.name) {
+    const m = new Model(name, [...this.size], [...this.position]);
+    m.voxels.set(this.voxels);
+    m.pivot = this.pivot && [...this.pivot];
+    m.parent = this.parent;
+    return m;
   }
 
   inBounds(x, y, z) {
@@ -82,6 +92,17 @@ export class Scene {
     this.palette = Array.from({ length: 256 }, () => [255, 255, 255, 255]);
     this.used = new Array(256).fill(false);
     this.materials = new Map(); // palette index -> MATL dict
+    this.attachments = new Map(); // name -> { parent, position } world-space mount points
+  }
+
+  clone() {
+    const s = new Scene();
+    for (const [name, m] of this.models) s.models.set(name, m.clone());
+    s.palette = this.palette.map((c) => [...c]);
+    s.used = [...this.used];
+    for (const [i, d] of this.materials) s.materials.set(i, { ...d });
+    for (const [n, a] of this.attachments) s.attachments.set(n, { parent: a.parent, position: [...a.position] });
+    return s;
   }
 
   addModel(name, size, position) {

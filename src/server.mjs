@@ -8,9 +8,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { Scene, MAX_DIM, encodeVox, decodeVox, toHex } from './vox.mjs';
 import { render, VIEW_NAMES } from './render.mjs';
+import { pivotOf, poseTransforms, hasRig, writeRig, readRig } from './rig.mjs';
+import { buildGlb } from './glb.mjs';
 
 const OUTPUT_DIR = process.env.VOX_OUTPUT_DIR || process.cwd();
+const UNDO_LIMIT = 30;
+const UNDO_BYTES = 256 * 1024 * 1024;
 let scene = new Scene();
+const history = []; // scene snapshots taken before each change, newest last
 
 const vec3 = z.array(z.number().int()).length(3);
 const color = z
@@ -21,35 +26,49 @@ const modelName = z.string().describe('Name of a model created with create_model
 const text = (s) => ({ content: [{ type: 'text', text: s }] });
 const fail = (e) => ({ content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
 
-function tool(name, description, inputSchema, handler) {
+// Registers a tool. Tools that change the scene snapshot it first so undo can restore it,
+// and a failing change rolls back automatically.
+function tool(name, description, inputSchema, handler, { readOnly = false } = {}) {
   server.registerTool(name, { description, inputSchema }, async (args) => {
+    const before = readOnly ? null : scene.clone();
     try {
-      return await handler(args);
+      const result = await handler(args);
+      if (before) {
+        history.push(before);
+        const bytes = (s) => [...s.models.values()].reduce((n, m) => n + m.voxels.length, 0);
+        let total = history.reduce((n, s) => n + bytes(s), 0);
+        while (history.length > 1 && (history.length > UNDO_LIMIT || total > UNDO_BYTES)) total -= bytes(history.shift());
+      }
+      return result;
     } catch (e) {
+      if (before) scene = before;
       return fail(e);
     }
   });
 }
 
 // Applies color index c to every voxel where test(x,y,z) is true, inside the given local box.
+// Returns how many voxels actually changed.
 function paint(model, c, lo, hi, test) {
   const from = lo.map((v) => Math.max(0, Math.floor(v)));
   const to = hi.map((v, k) => Math.min(model.size[k] - 1, Math.ceil(v)));
   let n = 0;
   for (let z = from[2]; z <= to[2]; z++)
     for (let y = from[1]; y <= to[1]; y++)
-      for (let x = from[0]; x <= to[0]; x++)
-        if (test(x, y, z)) {
-          model.voxels[model.index(x, y, z)] = c;
+      for (let x = from[0]; x <= to[0]; x++) {
+        const i = model.index(x, y, z);
+        if (model.voxels[i] !== c && test(x, y, z)) {
+          model.voxels[i] = c;
           n++;
         }
+      }
   return n;
 }
 
 const done = (model, n, c) =>
   text(`${c ? 'Painted' : 'Erased'} ${n} voxels in "${model.name}" (now ${model.count()} voxels).`);
 
-const server = new McpServer({ name: 'voxel', version: '1.0.0' });
+const server = new McpServer({ name: 'voxel', version: '1.1.0' });
 
 tool(
   'new_scene',
@@ -83,8 +102,11 @@ tool(
   async ({ model }) => {
     scene.model(model);
     scene.models.delete(model);
+    const orphans = [...scene.models.values()].filter((m) => m.parent === model);
+    for (const m of orphans) m.parent = null;
+    for (const [name, a] of scene.attachments) if (a.parent === model) scene.attachments.delete(name);
     scene.compactPalette();
-    return text(`Deleted "${model}".`);
+    return text(`Deleted "${model}".${orphans.length ? ` ${orphans.map((m) => m.name).join(', ')} no longer have a parent.` : ''}`);
   },
 );
 
@@ -221,16 +243,26 @@ tool(
     const m = scene.model(model);
     const c = scene.colorIndex(color);
     const steps = Math.max(...from.map((v, k) => Math.abs(to[k] - v)), 1);
-    const r = (thickness - 1) / 2;
+    // Brush of `thickness` voxels per axis (even sizes extend toward +), trimmed to a ball.
+    const lo = -Math.floor((thickness - 1) / 2);
+    const hi = Math.ceil((thickness - 1) / 2);
+    const mid = (lo + hi) / 2;
+    const reach = thickness / 2 + 0.01;
     let n = 0;
     for (let i = 0; i <= steps; i++) {
-      const p = from.map((v, k) => v + ((to[k] - v) * i) / steps);
-      for (let dz = -Math.ceil(r); dz <= Math.ceil(r); dz++)
-        for (let dy = -Math.ceil(r); dy <= Math.ceil(r); dy++)
-          for (let dx = -Math.ceil(r); dx <= Math.ceil(r); dx++)
-            if (Math.hypot(dx, dy, dz) <= r + 0.01 && m.set(Math.round(p[0]) + dx, Math.round(p[1]) + dy, Math.round(p[2]) + dz, c)) n++;
+      const p = from.map((v, k) => Math.round(v + ((to[k] - v) * i) / steps));
+      for (let dz = lo; dz <= hi; dz++)
+        for (let dy = lo; dy <= hi; dy++)
+          for (let dx = lo; dx <= hi; dx++) {
+            if (Math.hypot(dx - mid, dy - mid, dz - mid) > reach) continue;
+            const [x, y, z] = [p[0] + dx, p[1] + dy, p[2] + dz];
+            if (m.inBounds(x, y, z) && m.get(x, y, z) !== c) {
+              m.set(x, y, z, c);
+              n++;
+            }
+          }
     }
-    return text(`Drew a line of ${steps + 1} steps in "${model}" (now ${m.count()} voxels).`);
+    return text(`Drew a line of ${steps + 1} steps in "${model}", changing ${n} voxels (now ${m.count()} voxels).`);
   },
 );
 
@@ -269,7 +301,9 @@ tool(
         if (result === null || result === undefined || result === false) return;
         let c = cache.get(result);
         if (c === undefined) cache.set(result, (c = scene.colorIndex(result)));
-        m.voxels[m.index(x, y, z)] = c;
+        const i = m.index(x, y, z);
+        if (m.voxels[i] === c) return;
+        m.voxels[i] = c;
         c ? painted++ : erased++;
       },
     });
@@ -342,8 +376,186 @@ tool(
 );
 
 tool(
+  'replace_color',
+  'Swap colors in one or more models, e.g. to make team or skin variants. Use "empty" as the target to delete ' +
+    'every voxel of a color.',
+  {
+    pairs: z.array(z.object({ from: z.string(), to: color })).min(1).describe('Colors to replace, applied together.'),
+    models: z.array(modelName).optional().describe('Models to change. Default: all.'),
+  },
+  async ({ pairs, models }) => {
+    const targets = models ? models.map((n) => scene.model(n)) : [...scene.models.values()];
+    const map = new Map();
+    for (const { from, to } of pairs) map.set(scene.colorIndex(from), scene.colorIndex(to));
+    const counts = new Map();
+    for (const m of targets)
+      for (let i = 0; i < m.voxels.length; i++) {
+        const to = map.get(m.voxels[i]);
+        if (to === undefined || to === m.voxels[i]) continue;
+        counts.set(m.voxels[i], (counts.get(m.voxels[i]) ?? 0) + 1);
+        m.voxels[i] = to;
+      }
+    const report = pairs.map(({ from, to }) => `${from} -> ${to}: ${counts.get(scene.colorIndex(from)) ?? 0}`);
+    scene.compactPalette();
+    return text(`Replaced colors in ${targets.map((m) => m.name).join(', ')}.\n${report.join('\n')}`);
+  },
+);
+
+tool(
+  'duplicate_model',
+  'Copy a model under a new name, optionally mirrored. With mirror_plane the copy is placed on the other side of ' +
+    'that world plane (e.g. axis "x" and plane 16 turns a right arm at x=0 into a left arm at x=25); its pivot is ' +
+    'mirrored too, so it stays rig-ready.',
+  {
+    model: modelName,
+    new_name: z.string(),
+    mirror: z.enum(['x', 'y', 'z']).optional().describe('Flip the voxels along this axis.'),
+    mirror_plane: z.number().optional().describe('World coordinate of the mirror plane along the mirror axis.'),
+    position: vec3.optional().describe('Explicit world position for the copy (overrides mirror_plane placement).'),
+    parent: z.string().nullable().optional().describe('Rig parent for the copy. Default: same as the source.'),
+  },
+  async ({ model, new_name, mirror, mirror_plane, position, parent }) => {
+    const src = scene.model(model);
+    if (scene.models.has(new_name)) throw new Error(`A model named "${new_name}" already exists.`);
+    if (mirror_plane !== undefined && !mirror) throw new Error('mirror_plane needs mirror (the axis).');
+    const copy = src.clone(new_name);
+    const a = mirror ? { x: 0, y: 1, z: 2 }[mirror] : -1;
+    if (mirror) {
+      const [sx, sy, sz] = src.size;
+      for (let z = 0; z < sz; z++)
+        for (let y = 0; y < sy; y++)
+          for (let x = 0; x < sx; x++) {
+            const p = [x, y, z];
+            p[a] = src.size[a] - 1 - p[a];
+            copy.voxels[copy.index(...p)] = src.voxels[src.index(x, y, z)];
+          }
+    }
+    // Keep the pivot at the same spot relative to the voxels.
+    const localPivot = src.pivot ? src.pivot.map((v, k) => v - src.position[k]) : null;
+    if (localPivot && mirror) localPivot[a] = src.size[a] - localPivot[a];
+    if (mirror_plane !== undefined) copy.position[a] = 2 * mirror_plane - (src.position[a] + src.size[a]);
+    if (position) copy.position = [...position];
+    copy.pivot = localPivot && localPivot.map((v, k) => v + copy.position[k]);
+    if (parent !== undefined) {
+      if (parent !== null) scene.model(parent);
+      copy.parent = parent;
+    }
+    scene.models.set(new_name, copy);
+    poseTransforms(scene);
+    return text(
+      `Created "${new_name}" from "${model}"${mirror ? ` mirrored on ${mirror}` : ''} at ${copy.position.join(',')}` +
+        `${copy.parent ? `, parent "${copy.parent}"` : ''}.`,
+    );
+  },
+);
+
+tool(
+  'import_model',
+  'Bring models from another .vox file into the current scene (for example an accessory designed separately). ' +
+    'Colors are merged into the current palette; pivots and parents come along when the file has a .rig.json.',
+  {
+    file: z.string().describe('File name or absolute path.'),
+    models: z.array(z.string()).optional().describe('Models to import from that file. Default: all.'),
+    prefix: z.string().optional().describe('Text prepended to each imported model name to avoid clashes.'),
+    offset: vec3.optional().describe('World offset added to the imported positions and pivots.'),
+  },
+  async ({ file, models, prefix = '', offset = [0, 0, 0] }) => {
+    const p = resolvePath(file);
+    const { scene: other } = decodeVox(fs.readFileSync(p));
+    readRig(other, p);
+    const picked = models ? models.map((n) => other.model(n)) : [...other.models.values()];
+    const renamed = new Map(picked.map((m) => [m.name, prefix + m.name]));
+    for (const name of renamed.values()) if (scene.models.has(name)) throw new Error(`A model named "${name}" already exists; use prefix.`);
+    const remap = new Map();
+    const indexFor = (i) => {
+      if (!remap.has(i)) {
+        const j = scene.colorIndex(toHex(other.palette[i]));
+        if (other.materials.has(i) && !scene.materials.has(j)) scene.materials.set(j, { ...other.materials.get(i) });
+        remap.set(i, j);
+      }
+      return remap.get(i);
+    };
+    for (const src of picked) {
+      const m = scene.addModel(renamed.get(src.name), [...src.size], src.position.map((v, k) => v + offset[k]));
+      for (let i = 0; i < src.voxels.length; i++) if (src.voxels[i]) m.voxels[i] = indexFor(src.voxels[i]);
+      m.pivot = src.pivot && src.pivot.map((v, k) => v + offset[k]);
+      m.parent = src.parent ? (renamed.get(src.parent) ?? src.parent) : null;
+    }
+    poseTransforms(scene);
+    return text(`Imported ${[...renamed.values()].join(', ')} from ${p}.`);
+  },
+);
+
+tool(
+  'set_pivot',
+  'Set the rig data of a model: its pivot (the joint it rotates around, in world coordinates) and its parent ' +
+    'model. Children follow their parent in posed previews and in export_glb. Use anchor to place the pivot ' +
+    'automatically at the top, bottom or center of the occupied voxels.',
+  {
+    model: modelName,
+    pivot: z.array(z.number()).length(3).optional().describe('World coordinates; fractions allowed, e.g. [3.5, 6.5, 30].'),
+    anchor: z.enum(['top', 'bottom', 'center']).optional().describe('Compute the pivot from the occupied bounds instead.'),
+    parent: z.string().nullable().optional().describe('Parent model name, or null for a root. Omit to keep it.'),
+  },
+  async ({ model, pivot, anchor, parent }) => {
+    const m = scene.model(model);
+    if (pivot && anchor) throw new Error('Pass pivot or anchor, not both.');
+    if (pivot) m.pivot = pivot;
+    if (anchor) {
+      const b = m.bounds();
+      if (!b) throw new Error(`"${model}" is empty, so it has no bounds to anchor to.`);
+      const c = b.min.map((v, k) => m.position[k] + (v + b.max[k] + 1) / 2);
+      if (anchor === 'top') c[2] = m.position[2] + b.max[2] + 1;
+      if (anchor === 'bottom') c[2] = m.position[2] + b.min[2];
+      m.pivot = c;
+    }
+    if (parent !== undefined) {
+      if (parent === model) throw new Error('A model cannot be its own parent.');
+      if (parent !== null) scene.model(parent);
+      m.parent = parent;
+    }
+    poseTransforms(scene); // throws on cycles, which rolls the change back
+    return text(`"${model}": pivot ${pivotOf(m).join(', ')}, parent ${m.parent ?? '(none)'}.`);
+  },
+);
+
+tool(
+  'set_attachment',
+  'Define (or remove) a named mount point such as "hat", "weapon_r" or "back". It follows its parent model in ' +
+    'poses and becomes an empty node in export_glb, so accessories can be attached in the game.',
+  {
+    name: z.string(),
+    parent: modelName.optional().describe('Model the point moves with. Required unless removing.'),
+    position: z.array(z.number()).length(3).optional().describe('World coordinates. Required unless removing.'),
+    remove: z.boolean().optional(),
+  },
+  async ({ name, parent, position, remove }) => {
+    if (remove) {
+      if (!scene.attachments.delete(name)) throw new Error(`No attachment named "${name}".`);
+      return text(`Removed attachment "${name}".`);
+    }
+    if (!parent || !position) throw new Error('parent and position are required.');
+    scene.model(parent);
+    scene.attachments.set(name, { parent, position });
+    return text(`Attachment "${name}" on "${parent}" at ${position.join(', ')}.`);
+  },
+);
+
+tool(
+  'undo',
+  `Revert the last change to the scene (up to ${UNDO_LIMIT} steps).`,
+  {},
+  async () => {
+    if (!history.length) throw new Error('Nothing to undo.');
+    scene = history.pop();
+    return text(`Undid the last change (${history.length} more step(s) available).`);
+  },
+  { readOnly: true },
+);
+
+tool(
   'get_scene_info',
-  'Describe the current scene: models, sizes, positions, voxel counts, occupied bounds and colors in use.',
+  'Describe the current scene: models, sizes, positions, voxel counts, occupied bounds, rig and colors in use.',
   {},
   async () => {
     if (scene.models.size === 0) return text('The scene is empty. Use create_model to start.');
@@ -354,44 +566,60 @@ tool(
       const b = m.bounds();
       lines.push(
         `- ${m.name}: size ${m.size.join('x')}, position ${m.position.join(',')}, ${m.count()} voxels` +
-          (b ? `, occupied local ${b.min.join(',')} to ${b.max.join(',')}` : ''),
+          (b ? `, occupied local ${b.min.join(',')} to ${b.max.join(',')}` : '') +
+          (m.pivot || m.parent ? `; pivot ${pivotOf(m).join(',')}, parent ${m.parent ?? '(none)'}` : ''),
       );
     }
+    const attach = [...scene.attachments].map(([n, a]) => `- ${n} on ${a.parent} at ${a.position.join(',')}`);
     const colors = [...counts]
       .sort((a, b) => b[1] - a[1])
       .map(([i, n]) => `${toHex(scene.palette[i])} x${n}${scene.materials.has(i) ? ` (${scene.materials.get(i)._type.slice(1)})` : ''}`);
-    return text(`Models:\n${lines.join('\n')}\nColors (${colors.length}/255): ${colors.join(', ')}`);
+    return text(
+      `Models:\n${lines.join('\n')}\n` +
+        (attach.length ? `Attachments:\n${attach.join('\n')}\n` : '') +
+        `Colors (${colors.length}/255): ${colors.join(', ')}`,
+    );
   },
+  { readOnly: true },
 );
+
+const rotation = z.array(z.number()).length(3);
 
 tool(
   'render_preview',
   'Render the scene (or chosen models) to PNG images so you can check the result. Simple flat shading, not ' +
-    `MagicaVoxel's path tracer. Views: ${VIEW_NAMES.join(', ')}.`,
+    `MagicaVoxel's path tracer. Views: ${VIEW_NAMES.join(', ')}. Pass pose to rotate models around their pivots ` +
+    '(children follow their parents) and check how joints bend.',
   {
     views: z.array(z.enum(VIEW_NAMES)).min(1).max(4).optional().describe('Default ["iso"].'),
     models: z.array(z.string()).optional().describe('Only render these models. Default: all.'),
     size: z.number().int().min(64).max(1024).optional().describe('Image width/height in pixels. Default 512.'),
+    pose: z
+      .record(z.string(), rotation)
+      .optional()
+      .describe('Model name -> [rx, ry, rz] degrees around the MagicaVoxel x, y, z axes (applied x, then y, then z).'),
   },
-  async ({ views = ['iso'], models, size = 512 }) => {
+  async ({ views = ['iso'], models, size = 512, pose }) => {
     const content = [];
     for (const view of views) {
       content.push({ type: 'text', text: `View: ${view}` });
-      content.push({ type: 'image', data: render(scene, { view, size, models }).toString('base64'), mimeType: 'image/png' });
+      content.push({ type: 'image', data: render(scene, { view, size, models, pose }).toString('base64'), mimeType: 'image/png' });
     }
     return { content };
   },
+  { readOnly: true },
 );
 
-function resolvePath(file) {
+function resolvePath(file, ext = '.vox') {
   let p = path.isAbsolute(file) ? file : path.join(OUTPUT_DIR, file);
-  if (!p.toLowerCase().endsWith('.vox')) p += '.vox';
+  if (!p.toLowerCase().endsWith(ext)) p += ext;
   return p;
 }
 
 tool(
   'save_vox',
-  `Save the whole scene as a MagicaVoxel .vox file. Relative names are saved in ${OUTPUT_DIR}.`,
+  `Save the whole scene as a MagicaVoxel .vox file. Relative names are saved in ${OUTPUT_DIR}. When the scene ` +
+    'has rig data (pivots, parents, attachments) a <name>.rig.json file is written next to it.',
   {
     file: z.string().describe('File name or absolute path. ".vox" is added if missing.'),
     overwrite: z.boolean().optional().describe('Replace an existing file. Default false.'),
@@ -403,22 +631,58 @@ tool(
     const buf = encodeVox(scene);
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, buf);
-    return text(`Saved ${p} (${buf.length} bytes, ${scene.models.size} model(s)).`);
+    const rig = hasRig(scene) ? `\nRig: ${writeRig(scene, p)}` : '';
+    return text(`Saved ${p} (${buf.length} bytes, ${scene.models.size} model(s)).${rig}`);
   },
+  { readOnly: true },
 );
 
 tool(
   'load_vox',
   'Replace the current scene with the contents of a .vox file so it can be edited. Translations are kept; ' +
-    'model rotations, animation frames and render settings are not.',
+    'model rotations, animation frames and render settings are not. A <name>.rig.json next to it is loaded too.',
   { file: z.string().describe('File name or absolute path.') },
   async ({ file }) => {
     const p = resolvePath(file);
     const { scene: loaded, warnings } = decodeVox(fs.readFileSync(p));
+    const rig = readRig(loaded, p);
     scene = loaded;
     const names = [...scene.models.values()].map((m) => `${m.name} (${m.size.join('x')}, ${m.count()} voxels)`);
-    return text(`Loaded ${p}: ${names.join(', ')}.${warnings.length ? `\nWarnings: ${[...new Set(warnings)].join(' ')}` : ''}`);
+    return text(
+      `Loaded ${p}: ${names.join(', ')}.` +
+        (rig ? `\nRig loaded from ${rig}.` : '') +
+        (warnings.length ? `\nWarnings: ${[...new Set(warnings)].join(' ')}` : ''),
+    );
   },
+);
+
+tool(
+  'export_glb',
+  'Export the scene (or chosen models) as a glTF binary (.glb) for Godot or other engines. Each model becomes an ' +
+    'optimized mesh node placed in the rig hierarchy with its origin at its pivot, so it can be rotated directly; ' +
+    'attachments become empty nodes. Colors use a 256x1 palette texture (swap it in the engine to recolor). ' +
+    'Axes are converted to glTF (y up, front facing +z). Render materials (metal, glass, emit) are not exported.',
+  {
+    file: z.string().describe('File name or absolute path. ".glb" is added if missing.'),
+    voxel_size: z.number().positive().optional().describe('Meters per voxel. Default 0.05.'),
+    models: z.array(z.string()).optional().describe('Only export these models. Default: all.'),
+    origin: z
+      .enum(['feet', 'world'])
+      .optional()
+      .describe('"feet" (default) centers the model and puts its lowest voxel on the ground (y = 0); "world" keeps MagicaVoxel coordinates.'),
+    overwrite: z.boolean().optional().describe('Replace an existing file. Default false.'),
+  },
+  async ({ file, voxel_size = 0.05, models, origin = 'feet', overwrite }) => {
+    const p = resolvePath(file, '.glb');
+    if (fs.existsSync(p) && !overwrite) throw new Error(`${p} already exists. Pass overwrite: true to replace it.`);
+    if (models) models.forEach((n) => scene.model(n));
+    poseTransforms(scene);
+    const { glb, stats } = buildGlb(scene, { voxelSize: voxel_size, models, origin, name: path.basename(p, '.glb') });
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, glb);
+    return text(`Exported ${p} (${glb.length} bytes, ${stats.meshes} meshes, ${stats.triangles} triangles, ${stats.nodes} nodes).`);
+  },
+  { readOnly: true },
 );
 
 await server.connect(new StdioServerTransport());
