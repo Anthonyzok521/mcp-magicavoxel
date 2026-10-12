@@ -689,17 +689,43 @@ tool(
       .enum(['feet', 'world'])
       .optional()
       .describe('"feet" (default) centers the model and puts its lowest voxel on the ground (y = 0); "world" keeps MagicaVoxel coordinates.'),
+    skinned: z
+      .boolean()
+      .optional()
+      .describe(
+        'Export a skeleton (glTF skin) instead of a node hierarchy: models become bones and each mesh is rigidly bound to ' +
+          'its bone, so engines import a Skeleton3D that animation tools can drive. Attachments become bone attachments.',
+      ),
+    skeleton_from: z
+      .string()
+      .optional()
+      .describe(
+        'With skinned: .vox file (with .rig.json) whose models define the bones, e.g. the base character when exporting ' +
+          'clothing. Each exported model is bound to the bone named by its parent. Default: the scene itself.',
+      ),
     overwrite: z.boolean().optional().describe('Replace an existing file. Default false.'),
   },
-  async ({ file, voxel_size = 0.05, models, origin = 'feet', overwrite }) => {
+  async ({ file, voxel_size = 0.05, models, origin = 'feet', skinned, skeleton_from, overwrite }) => {
     const p = resolvePath(file, '.glb');
     if (fs.existsSync(p) && !overwrite) throw new Error(`${p} already exists. Pass overwrite: true to replace it.`);
     if (models) models.forEach((n) => scene.model(n));
+    if (skeleton_from && !skinned) throw new Error('skeleton_from needs skinned: true.');
     poseTransforms(scene);
-    const { glb, stats } = buildGlb(scene, { voxelSize: voxel_size, models, origin, name: path.basename(p, '.glb') });
+    let skeleton = null;
+    if (skinned) {
+      if (skeleton_from) {
+        const sp = resolvePath(skeleton_from);
+        skeleton = decodeVox(fs.readFileSync(sp)).scene;
+        readRig(skeleton, sp);
+      } else skeleton = scene;
+    }
+    const { glb, stats } = buildGlb(scene, { voxelSize: voxel_size, models, origin, skeleton, name: path.basename(p, '.glb') });
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, glb);
-    return text(`Exported ${p} (${glb.length} bytes, ${stats.meshes} meshes, ${stats.triangles} triangles, ${stats.nodes} nodes).`);
+    return text(
+      `Exported ${p} (${glb.length} bytes, ${stats.meshes} meshes, ${stats.triangles} triangles, ${stats.nodes} nodes` +
+        `${stats.bones ? `, ${stats.bones} bones` : ''}).`,
+    );
   },
   { readOnly: true },
 );

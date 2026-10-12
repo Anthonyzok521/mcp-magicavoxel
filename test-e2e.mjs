@@ -111,6 +111,38 @@ assert.deepEqual(node('arm_r').children.map((i) => gltf.nodes[i].name), ['hand_r
 assert.deepEqual(node('body').translation.map((v) => +v.toFixed(6)), [0, 0.5, 0]);
 console.log('glb nodes:', gltf.nodes.map((n) => `${n.name} t=${(n.translation ?? []).map((v) => +v.toFixed(3))}`).join(' | '));
 
+// --- Skinned export: bones from the rig, meshes bound to them, clothing bound to another file's bones.
+const readGltf = (file) => {
+  const b = fs.readFileSync(path.join(out, file));
+  return JSON.parse(b.subarray(20, 20 + b.readUInt32LE(12)).toString('utf8'));
+};
+assert.match(await call('export_glb', { file: 'rigged_skinned', voxel_size: 0.1, skinned: true }), /3 meshes, \d+ triangles, \d+ nodes, 3 bones/);
+const sk = readGltf('rigged_skinned.glb');
+const skinJoints = sk.skins[0].joints.map((i) => sk.nodes[i].name);
+assert.deepEqual(skinJoints, ['body', 'arm_r', 'arm_l']);
+assert.deepEqual(sk.nodes.find((n) => n.name === 'arm_r').translation.map((v) => +v.toFixed(6)), [-0.6, 0.5, 0]);
+const skinnedMeshes = sk.nodes.filter((n) => n.mesh !== undefined);
+assert.equal(skinnedMeshes.length, 3);
+assert.ok(skinnedMeshes.every((n) => n.skin === 0 && n.name.endsWith('_mesh')));
+assert.ok(sk.meshes.every((m) => m.primitives[0].attributes.JOINTS_0 !== undefined));
+assert.deepEqual(sk.nodes.find((n) => n.name === 'arm_r').children.map((i) => sk.nodes[i].name), ['hand_r']);
+await call('new_scene');
+await call('import_model', { file: 'rigged' });
+await call('create_model', { name: 'glove', size: [4, 4, 2], position: [0, 0, 7] });
+await call('fill_box', { model: 'glove', from: [0, 0, 0], to: [3, 3, 1], color: '#2e2b26' });
+await call('export_glb', { file: 'glove', models: ['glove'], skinned: true, skeleton_from: 'rigged' }, { error: true });
+await call('set_pivot', { model: 'glove', pivot: [2, 2, 16], parent: 'arm_r' });
+assert.match(await call('export_glb', { file: 'glove', models: ['glove'], skinned: true, skeleton_from: 'rigged' }), /1 meshes, .*3 bones/);
+const gl = readGltf('glove.glb');
+assert.deepEqual(gl.skins[0].joints.map((i) => gl.nodes[i].name), ['body', 'arm_r', 'arm_l']);
+assert.equal(gl.nodes.find((n) => n.mesh !== undefined).name, 'glove');
+// Bound to joint 1 (arm_r): check the first JOINTS_0 entry in the binary chunk.
+const glb2 = fs.readFileSync(path.join(out, 'glove.glb'));
+const binStart = 20 + glb2.readUInt32LE(12) + 8;
+const jAcc = gl.accessors[gl.meshes[0].primitives[0].attributes.JOINTS_0];
+const jView = gl.bufferViews[jAcc.bufferView];
+assert.equal(glb2.readUInt16LE(binStart + jView.byteOffset), 1);
+
 for (const f of samples ? ['chr_knight.vox', 'castle.vox', 'cars.vox'] : []) {
   await call('load_vox', { file: path.join(samples, f) });
   const t = Date.now();

@@ -125,6 +125,8 @@ Las rotaciones de `pose` son `[rx, ry, rz]` en grados sobre esos mismos ejes, ap
 - **Textura de paleta** de 256×1 con filtro *nearest*: para cambiar un color en el juego (piel, equipo) basta modificar o sustituir esa textura.
 - **Ejes convertidos a glTF**: y hacia arriba, frente hacia +z.
 - `origin: "feet"` (por defecto) centra el modelo y apoya su voxel más bajo en y = 0; `origin: "world"` conserva las coordenadas de MagicaVoxel.
+- **`skinned: true`** exporta un **esqueleto** (glTF skin) en lugar de nodos: cada objeto pasa a ser un hueso y su malla queda ligada rígidamente a él. Godot lo importa como `Skeleton3D`, listo para `AnimationPlayer`/`AnimationTree`, y los puntos de enganche se convierten en `BoneAttachment3D`.
+- **`skeleton_from: "personaje.vox"`** (con `skinned`) liga la ropa y los accesorios a los huesos de otro archivo: cada pieza se une al hueso indicado por su `parent`. En el motor basta con mover sus mallas al `Skeleton3D` del personaje.
 - `voxel_size` fija los metros por voxel (0.05 por defecto; con 0.04, un personaje de 46 voxeles mide 1,84 m).
 
 Probado con el validador de Khronos (0 errores) y con la importación de Godot 4.7.1.

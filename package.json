@@ -1,6 +1,6 @@
 {
   "name": "mcp-magicavoxel",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "MCP server that lets AI agents build voxel models, save MagicaVoxel .vox files and export rigged .glb for game engines",
   "main": "src/server.mjs",
   "bin": {

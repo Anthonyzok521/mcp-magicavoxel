@@ -78,15 +78,35 @@ function meshModel(m) {
   return { positions, normals, uvs, indices };
 }
 
+
+// Bones in parent-before-child order.
+function orderBones(skeleton) {
+  const all = [...skeleton.models.values()];
+  const names = new Set(all.map((m) => m.name));
+  const ordered = [];
+  const visit = (m) => {
+    if (ordered.includes(m)) return;
+    if (m.parent && names.has(m.parent)) visit(skeleton.model(m.parent));
+    ordered.push(m);
+  };
+  all.forEach(visit);
+  return ordered;
+}
+
 // origin "feet": the occupied voxels are centered on x/y and rest on z = 0 (the ground);
 // origin "world": MagicaVoxel world coordinates are kept as they are.
-export function buildGlb(scene, { voxelSize = 0.05, models, name = 'voxel_scene', origin = 'feet' } = {}) {
+// skeleton: a Scene whose models become bones (a glTF skin). Each exported model is then a
+// mesh rigidly bound to the bone of the same name, or to the bone named by its parent, so
+// clothing exported with the body's skeleton deforms with the body. Bounds for "feet" come
+// from the skeleton, so every file bound to the same skeleton lines up.
+export function buildGlb(scene, { voxelSize = 0.05, models, name = 'voxel_scene', origin = 'feet', skeleton = null } = {}) {
   const selected = [...scene.models.values()].filter((m) => !models || models.includes(m.name));
   if (!selected.length) throw new Error('No models to export.');
   const names = new Set(selected.map((m) => m.name));
-  const bounds = scene.worldBounds([...names]);
+  const bounds = skeleton ? skeleton.worldBounds() : scene.worldBounds([...names]);
   const rootOrigin =
     origin === 'feet' && bounds ? [(bounds.min[0] + bounds.max[0] + 1) / 2, (bounds.min[1] + bounds.max[1] + 1) / 2, bounds.min[2]] : [0, 0, 0];
+  const rel = (p, base) => toGltf(p.map((x, k) => x - base[k]), voxelSize);
 
   const bin = [];
   let binLength = 0;
@@ -103,10 +123,10 @@ export function buildGlb(scene, { voxelSize = 0.05, models, name = 'voxel_scene'
     binLength += buf.length;
     return bufferViews.length - 1;
   };
+  const typed = { 5125: Uint32Array, 5123: Uint16Array, 5126: Float32Array };
   const addAccessor = (rows, type, componentType, target, withBounds) => {
     const width = rows[0].length ?? 1;
-    const flat = rows.flat();
-    const buf = componentType === 5125 ? Buffer.from(new Uint32Array(flat).buffer) : Buffer.from(new Float32Array(flat).buffer);
+    const buf = Buffer.from(new typed[componentType](rows.flat()).buffer);
     const acc = { bufferView: addView(buf, target), componentType, count: rows.length, type };
     if (withBounds) {
       acc.min = Array(width).fill(Infinity);
@@ -126,57 +146,97 @@ export function buildGlb(scene, { voxelSize = 0.05, models, name = 'voxel_scene'
   for (let i = 1; i < 256; i++) Buffer.from(scene.palette[i]).copy(pal, i * 4);
   const imageView = addView(encodePng(pal, 256, 1, 4));
 
-  const nodes = [{ name, children: [] }];
   const meshes = [];
-  const nodeIndex = new Map();
-  for (const m of selected) {
-    const pivot = pivotOf(m);
+  // Greedy mesh of model m with vertices placed relative to `base` (world voxel coordinates).
+  const addMesh = (m, base, extra = {}) => {
     const mesh = meshModel(m);
-    const node = { name: m.name };
-    if (mesh.indices.length) {
-      const pos = mesh.positions.map((p) => toGltf(p.map((x, k) => x + m.position[k] - pivot[k]), voxelSize));
-      const nrm = mesh.normals.map((n) => toGltf(n, 1));
-      meshes.push({
-        name: m.name,
-        primitives: [
-          {
-            attributes: {
-              POSITION: addAccessor(pos, 'VEC3', 5126, 34962, true),
-              NORMAL: addAccessor(nrm, 'VEC3', 5126, 34962),
-              TEXCOORD_0: addAccessor(mesh.uvs, 'VEC2', 5126, 34962),
-            },
-            indices: addAccessor(mesh.indices.map((i) => [i]), 'SCALAR', 5125, 34963),
-            material: 0,
-          },
-        ],
-      });
-      node.mesh = meshes.length - 1;
+    if (!mesh.indices.length) return null;
+    const pos = mesh.positions.map((p) => rel(p.map((x, k) => x + m.position[k]), base));
+    const attributes = {
+      POSITION: addAccessor(pos, 'VEC3', 5126, 34962, true),
+      NORMAL: addAccessor(mesh.normals.map((n) => toGltf(n, 1)), 'VEC3', 5126, 34962),
+      TEXCOORD_0: addAccessor(mesh.uvs, 'VEC2', 5126, 34962),
+    };
+    if (extra.joint !== undefined) {
+      attributes.JOINTS_0 = addAccessor(pos.map(() => [extra.joint, 0, 0, 0]), 'VEC4', 5123, 34962);
+      attributes.WEIGHTS_0 = addAccessor(pos.map(() => [1, 0, 0, 0]), 'VEC4', 5126, 34962);
     }
-    nodes.push(node);
-    nodeIndex.set(m.name, nodes.length - 1);
-  }
-  // Parent each node and express its pivot relative to the parent's pivot.
-  for (const m of selected) {
-    const node = nodes[nodeIndex.get(m.name)];
-    const parent = m.parent && names.has(m.parent) ? scene.model(m.parent) : null;
-    const base = parent ? pivotOf(parent) : rootOrigin;
-    node.translation = toGltf(pivotOf(m).map((x, k) => x - base[k]), voxelSize);
-    const parentNode = nodes[parent ? nodeIndex.get(parent.name) : 0];
-    (parentNode.children ??= []).push(nodeIndex.get(m.name));
-  }
-  for (const [attachName, a] of scene.attachments) {
-    if (a.parent && !names.has(a.parent)) continue;
-    const base = a.parent ? pivotOf(scene.model(a.parent)) : rootOrigin;
-    nodes.push({ name: attachName, translation: toGltf(a.position.map((x, k) => x - base[k]), voxelSize) });
-    const parentNode = nodes[a.parent ? nodeIndex.get(a.parent) : 0];
-    (parentNode.children ??= []).push(nodes.length - 1);
+    meshes.push({
+      name: m.name,
+      primitives: [{ attributes, indices: addAccessor(mesh.indices.map((i) => [i]), 'SCALAR', 5125, 34963), material: 0 }],
+    });
+    return meshes.length - 1;
+  };
+
+  const nodes = [];
+  const sceneRoots = [];
+  let skins;
+  const addChild = (parentIndex, childIndex) => (nodes[parentIndex].children ??= []).push(childIndex);
+
+  if (skeleton) {
+    const bones = orderBones(skeleton);
+    const boneIndex = new Map();
+    for (const b of bones) {
+      nodes.push({ name: b.name });
+      boneIndex.set(b.name, nodes.length - 1);
+    }
+    for (const b of bones) {
+      const parent = b.parent && boneIndex.has(b.parent) ? skeleton.model(b.parent) : null;
+      nodes[boneIndex.get(b.name)].translation = rel(pivotOf(b), parent ? pivotOf(parent) : rootOrigin);
+      if (parent) addChild(boneIndex.get(parent.name), boneIndex.get(b.name));
+      else sceneRoots.push(boneIndex.get(b.name));
+    }
+    for (const [attachName, a] of scene.attachments) {
+      if (!a.parent || !boneIndex.has(a.parent)) continue;
+      nodes.push({ name: attachName, translation: rel(a.position, pivotOf(skeleton.model(a.parent))) });
+      addChild(boneIndex.get(a.parent), nodes.length - 1);
+    }
+    // Rest pose has no rotations, so each inverse bind matrix is a translation (column-major).
+    const ibm = bones.map((b) => {
+      const g = rel(pivotOf(b), rootOrigin);
+      return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -g[0], -g[1], -g[2], 1];
+    });
+    skins = [{ name: 'skeleton', joints: bones.map((b) => boneIndex.get(b.name)), inverseBindMatrices: addAccessor(ibm, 'MAT4', 5126) }];
+    if (sceneRoots.length === 1) skins[0].skeleton = sceneRoots[0];
+    for (const m of selected) {
+      const bone = boneIndex.has(m.name) ? m.name : m.parent;
+      if (!bone || !boneIndex.has(bone)) throw new Error(`"${m.name}" is not a bone and its parent is not a bone of the skeleton.`);
+      const mesh = addMesh(m, rootOrigin, { joint: bones.findIndex((b) => b.name === bone) });
+      if (mesh === null) continue;
+      // Skinned mesh nodes are scene roots: glTF ignores their transform anyway.
+      nodes.push({ name: boneIndex.has(m.name) ? `${m.name}_mesh` : m.name, mesh, skin: 0 });
+      sceneRoots.push(nodes.length - 1);
+    }
+  } else {
+    nodes.push({ name, children: [] });
+    sceneRoots.push(0);
+    const nodeIndex = new Map();
+    for (const m of selected) {
+      const node = { name: m.name };
+      const mesh = addMesh(m, pivotOf(m));
+      if (mesh !== null) node.mesh = mesh;
+      nodes.push(node);
+      nodeIndex.set(m.name, nodes.length - 1);
+    }
+    // Parent each node and express its pivot relative to the parent's pivot.
+    for (const m of selected) {
+      const parent = m.parent && names.has(m.parent) ? scene.model(m.parent) : null;
+      nodes[nodeIndex.get(m.name)].translation = rel(pivotOf(m), parent ? pivotOf(parent) : rootOrigin);
+      addChild(parent ? nodeIndex.get(parent.name) : 0, nodeIndex.get(m.name));
+    }
+    for (const [attachName, a] of scene.attachments) {
+      if (a.parent && !names.has(a.parent)) continue;
+      nodes.push({ name: attachName, translation: rel(a.position, a.parent ? pivotOf(scene.model(a.parent)) : rootOrigin) });
+      addChild(a.parent ? nodeIndex.get(a.parent) : 0, nodes.length - 1);
+    }
   }
 
   const json = {
     asset: { version: '2.0', generator: 'mcp-magicavoxel' },
     scene: 0,
-    scenes: [{ name, nodes: [0] }],
+    scenes: [{ name, nodes: sceneRoots }],
     nodes,
+    ...(skins ? { skins } : {}),
     meshes,
     materials: [
       {
@@ -212,6 +272,11 @@ export function buildGlb(scene, { voxelSize = 0.05, models, name = 'voxel_scene'
   header.writeUInt32LE(0x46546c67, 0);
   header.writeUInt32LE(2, 4);
   header.writeUInt32LE(12 + body.length, 8);
-  const stats = { nodes: nodes.length, meshes: meshes.length, triangles: meshes.reduce((n, mm) => n + accessors[mm.primitives[0].indices].count / 3, 0) };
+  const stats = {
+    nodes: nodes.length,
+    meshes: meshes.length,
+    bones: skins ? skins[0].joints.length : 0,
+    triangles: meshes.reduce((n, mm) => n + accessors[mm.primitives[0].indices].count / 3, 0),
+  };
   return { glb: Buffer.concat([header, body]), stats };
 }
